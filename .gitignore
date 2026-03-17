@@ -1,0 +1,12 @@
+# Generated output files – do not commit
+comportament/scripts/chicken_simulated_data_full.csv
+comportament/scripts/chicken_features_for_classification.csv
+comportament/scripts/behaviour_time_budget.png
+comportament/scripts/confusion_matrix.png
+comportament/scripts/keypoint_trajectories.png
+comportament/scripts/keypoint_snapshots.png
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
