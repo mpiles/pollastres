@@ -26,11 +26,17 @@
 #   9.  Save the normalised feature dataset to CSV.
 #  10.  Train a Random Forest classifier (state ~ features).
 #  11.  Predict behaviour labels for every frame.
-#  12.  Compute time budget per individual and in aggregate.
-#  13.  Save per-individual time budget to CSV.
+#  12.  Compute classification quality metrics:
+#         per-class  – Precision, Recall (Sensitivity), Specificity, F1-score
+#         overall    – Accuracy, Macro-averaged F1
+#       Save metrics to CSV and plot a confusion-matrix heatmap.
+#  13.  Compute time budget per individual and in aggregate.
+#  14.  Save per-individual time budget to CSV.
 #
-# Generates three visualisations:
-#   behaviour_time_budget.png   – mean ± SD minutes per behaviour
+# Generates four visualisations:
+#   confusion_matrix.png        – heatmap of the confusion matrix
+#                                 (row-normalised proportions)
+#   behaviour_time_budget.png   – mean +/- SD minutes per behaviour
 #                                 (aggregated across all individuals)
 #   keypoint_trajectories.png   – neck trajectory of one individual
 #                                 coloured by predicted behaviour
@@ -43,7 +49,9 @@
 #
 # Output files written to the working directory:
 #   chicken_features_for_classification.csv
+#   classification_metrics.csv
 #   time_budget_per_individual.csv
+#   confusion_matrix.png
 #   behaviour_time_budget.png
 #   keypoint_trajectories.png
 #   keypoint_snapshots.png
@@ -326,7 +334,219 @@ print(model)   # displays the OOB error estimate and the confusion matrix
 feats_scaled$predicted <- predict(model, feats_scaled)
 
 # ==============================================================
-# 12. TIME BUDGET PER INDIVIDUAL AND IN AGGREGATE
+# 12. CLASSIFICATION QUALITY METRICS
+# ==============================================================
+#
+# We compare the ground-truth label (feats_scaled$state) with the
+# Random Forest prediction (feats_scaled$predicted) to evaluate how
+# well the classifier has learned each behaviour.
+#
+# All metrics are derived from the confusion matrix, a square table
+# where rows = true class and columns = predicted class.
+# For a five-class problem, per-class metrics are computed using a
+# one-vs-rest decomposition:
+#
+#   TP_k = frames correctly predicted as behaviour k
+#   FP_k = frames of another behaviour wrongly predicted as k
+#   FN_k = frames of behaviour k wrongly predicted as something else
+#   TN_k = frames of neither k (true) nor k (predicted)
+#
+# From these counts we derive:
+#   Precision_k   = TP_k / (TP_k + FP_k)   – of all frames predicted k,
+#                                              how many really are k?
+#   Recall_k      = TP_k / (TP_k + FN_k)   – of all true k frames, how
+#   (Sensitivity)                              many were correctly found?
+#   Specificity_k = TN_k / (TN_k + FP_k)   – of all true non-k frames,
+#                                              how many were left as non-k?
+#   F1_k          = 2 * Precision_k * Recall_k /
+#                       (Precision_k + Recall_k)
+#
+# Overall metrics:
+#   Accuracy  = sum of diagonal / total frames
+#   Macro F1  = unweighted mean of per-class F1 scores
+
+# ------------------------------------------------------------------
+# 12a. Build the confusion matrix
+# ------------------------------------------------------------------
+
+# table() counts every (truth, prediction) combination.
+# Both vectors are converted to character first so that factor levels
+# that happen to be absent in one column do not create empty rows/cols.
+conf_mat <- table(
+  Truth     = as.character(feats_scaled$state),
+  Predicted = as.character(feats_scaled$predicted)
+)
+
+message("\nConfusion matrix (rows = truth, columns = predicted):")
+print(conf_mat)
+
+# ------------------------------------------------------------------
+# 12b. Per-class metrics
+# ------------------------------------------------------------------
+
+class_names <- rownames(conf_mat)   # behaviour labels in alphabetical order
+n_classes   <- length(class_names)
+n_total     <- sum(conf_mat)         # total number of frames evaluated
+
+# Pre-allocate result vectors
+precision   <- numeric(n_classes)
+recall      <- numeric(n_classes)
+specificity <- numeric(n_classes)
+f1          <- numeric(n_classes)
+names(precision) <- names(recall) <- names(specificity) <- names(f1) <- class_names
+
+for (k in class_names) {
+  TP <- conf_mat[k, k]
+  FP <- sum(conf_mat[, k]) - TP   # column sum minus diagonal
+  FN <- sum(conf_mat[k, ]) - TP   # row sum minus diagonal
+  TN <- n_total - TP - FP - FN
+
+  # Guard against division by zero (class absent in predictions or truth)
+  precision[k]   <- if ((TP + FP) > 0) TP / (TP + FP)   else NA_real_
+  recall[k]      <- if ((TP + FN) > 0) TP / (TP + FN)   else NA_real_
+  specificity[k] <- if ((TN + FP) > 0) TN / (TN + FP)   else NA_real_
+  f1[k]          <- if (!is.na(precision[k]) & !is.na(recall[k]) &
+                         (precision[k] + recall[k]) > 0)
+                      2 * precision[k] * recall[k] / (precision[k] + recall[k])
+                    else NA_real_
+}
+
+# ------------------------------------------------------------------
+# 12c. Overall metrics
+# ------------------------------------------------------------------
+
+accuracy <- sum(diag(conf_mat)) / n_total
+macro_f1 <- mean(f1, na.rm = TRUE)
+
+message(sprintf("\nOverall accuracy : %.4f", accuracy))
+message(sprintf("Macro-avg F1     : %.4f", macro_f1))
+
+# ------------------------------------------------------------------
+# 12d. Assemble and print per-class metrics table
+# ------------------------------------------------------------------
+
+metrics_df <- data.frame(
+  behaviour   = class_names,
+  precision   = round(precision,   4),
+  recall      = round(recall,      4),   # = sensitivity
+  specificity = round(specificity, 4),
+  f1_score    = round(f1,          4),
+  row.names   = NULL
+)
+
+message("\nPer-class classification metrics:")
+print(metrics_df)
+
+# ------------------------------------------------------------------
+# 12e. Save metrics to CSV
+# ------------------------------------------------------------------
+
+# Append summary rows following the sklearn classification_report convention:
+#   "macro avg"  row: mean precision, recall, specificity and macro F1
+#   "accuracy"   row: overall accuracy placed in the f1_score column,
+#                     other per-class columns left NA (accuracy is not a
+#                     per-class metric)
+macro_row <- data.frame(
+  behaviour   = "macro avg",
+  precision   = round(mean(precision,   na.rm = TRUE), 4),
+  recall      = round(mean(recall,      na.rm = TRUE), 4),
+  specificity = round(mean(specificity, na.rm = TRUE), 4),
+  f1_score    = round(macro_f1, 4)
+)
+accuracy_row <- data.frame(
+  behaviour   = "accuracy",
+  precision   = NA_real_,
+  recall      = NA_real_,
+  specificity = NA_real_,
+  f1_score    = round(accuracy, 4)
+)
+
+write.csv(
+  rbind(metrics_df, macro_row, accuracy_row),
+  "classification_metrics.csv",
+  row.names = FALSE
+)
+message("Classification metrics saved: classification_metrics.csv")
+
+# ------------------------------------------------------------------
+# VISUALISATION 1: CONFUSION MATRIX HEATMAP
+# ------------------------------------------------------------------
+#
+# The confusion matrix is displayed as a colour-coded heatmap where
+# each cell contains the row-normalised proportion of frames:
+#   proportion[i, j] = conf_mat[i, j] / sum(conf_mat[i, ])
+# Row normalisation shows recall per class along the diagonal and
+# the distribution of errors off the diagonal, independently of
+# class size differences.
+# Darker blue = higher proportion; the ideal matrix is dark blue
+# only along the diagonal and white everywhere else.
+
+# Row-normalise: divide each row by its row total
+conf_norm <- conf_mat / rowSums(conf_mat)
+
+png("confusion_matrix.png", width = 700, height = 620)
+
+# colour ramp: white (0) → steel-blue (1)
+cm_cols <- colorRampPalette(c("white", "steelblue"))(100)
+
+# image() draws the matrix with x = predicted (columns) and y = truth (rows).
+# Columns of conf_norm are indexed by x; rows by y.
+# We reverse the y axis (ylim, y values descending) so that the first class
+# appears at the top, matching the conventional confusion-matrix orientation.
+n_cl <- nrow(conf_norm)
+image(
+  x    = seq_len(n_cl),
+  y    = seq_len(n_cl),
+  z    = t(conf_norm[n_cl:1, ]),   # transpose + flip rows for image() orientation
+  col  = cm_cols,
+  zlim = c(0, 1),
+  xaxt = "n", yaxt = "n",
+  xlab = "Predicted behaviour",
+  ylab = "True behaviour",
+  main = "Confusion matrix (row-normalised proportions)"
+)
+
+# Axis labels
+axis(1, at = seq_len(n_cl), labels = colnames(conf_norm), las = 2, cex.axis = 0.9)
+axis(2, at = seq_len(n_cl), labels = rev(rownames(conf_norm)), las = 1, cex.axis = 0.9)
+
+# Cell text: proportion value (2 decimal places)
+for (i in seq_len(n_cl)) {          # i indexes predicted (x, columns of conf_norm)
+  for (j in seq_len(n_cl)) {        # j indexes truth    (y, rows of conf_norm, reversed)
+    val <- conf_norm[n_cl + 1 - j, i]   # map (x=i, y=j) back to original matrix cell
+    text(
+      x      = i,
+      y      = j,
+      labels = sprintf("%.2f", val),
+      cex    = 0.85,
+      # Use white text on dark cells and black text on light cells for readability
+      col    = if (val > 0.55) "white" else "black"
+    )
+  }
+}
+
+# Colour-scale legend on the right side
+par(new = TRUE)
+image(
+  x    = c(n_cl + 0.6, n_cl + 0.9),
+  y    = seq(0.5, n_cl + 0.5, length.out = 100),
+  z    = matrix(seq(0, 1, length.out = 100), nrow = 1),
+  col  = cm_cols,
+  add  = FALSE,
+  xaxt = "n", yaxt = "n",
+  xlim = c(0.5, n_cl + 1),
+  ylim = c(0.5, n_cl + 0.5),
+  xlab = "", ylab = "", main = "",
+  bty  = "n"
+)
+axis(4, at = c(0.5, n_cl / 2, n_cl + 0.5),
+     labels = c("0.00", "0.50", "1.00"), las = 1, cex.axis = 0.8)
+
+dev.off()
+message("Saved: confusion_matrix.png")
+
+# ==============================================================
+# 13. TIME BUDGET PER INDIVIDUAL AND IN AGGREGATE
 # ==============================================================
 
 # Count predicted frames per behaviour per individual.
@@ -337,7 +557,7 @@ time_budget <- feats_scaled %>%
   mutate(minutes = frames / fps / 60)
 
 # ==============================================================
-# 13. SAVE PER-INDIVIDUAL TIME BUDGET
+# 14. SAVE PER-INDIVIDUAL TIME BUDGET
 # ==============================================================
 
 write.csv(time_budget, "time_budget_per_individual.csv", row.names = FALSE)
@@ -358,7 +578,7 @@ message("\nBehavioural time budget (mean ± SD minutes per individual):")
 print(as.data.frame(agg_budget))
 
 # ==============================================================
-# VISUALISATION 1: BEHAVIOUR TIME BUDGET
+# VISUALISATION 2: BEHAVIOUR TIME BUDGET
 # ==============================================================
 #
 # Bar chart showing the mean minutes per behaviour across all
@@ -405,7 +625,7 @@ dev.off()
 message("Saved: behaviour_time_budget.png")
 
 # ==============================================================
-# VISUALISATION 2: KEYPOINT TRAJECTORIES
+# VISUALISATION 3: KEYPOINT TRAJECTORIES
 # ==============================================================
 #
 # The neck (body centre) trajectory of one individual is drawn
@@ -465,7 +685,7 @@ dev.off()
 message("Saved: keypoint_trajectories.png")
 
 # ==============================================================
-# VISUALISATION 3: SKELETON SNAPSHOTS
+# VISUALISATION 4: SKELETON SNAPSHOTS
 # ==============================================================
 #
 # A 4 × 4 grid of skeleton panels, each showing the three-
@@ -573,7 +793,9 @@ message("Saved: keypoint_snapshots.png")
 message("\nClassifBehaviour.R completed successfully.")
 message("Output files:")
 message("  chicken_features_for_classification.csv")
+message("  classification_metrics.csv")
 message("  time_budget_per_individual.csv")
+message("  confusion_matrix.png")
 message("  behaviour_time_budget.png")
 message("  keypoint_trajectories.png")
 message("  keypoint_snapshots.png")
