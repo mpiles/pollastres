@@ -89,6 +89,11 @@ epsilon      <- 1e-6  # small constant added to denominators to prevent division
 # decrease for finer resolution (e.g. 100 = 10 s).
 budget_window_frames <- 600
 
+# Transparency of the [Q0.05, Q0.95] ribbon in the longitudinal plot.
+# 0 = fully transparent, 1 = fully opaque.  0.22 gives a subtle tint that
+# remains readable on screen and in print without obscuring the median line.
+ribbon_alpha <- 0.22
+
 # Individual to display in the trajectory and snapshot plots.
 # Change to any valid individual_id present in the data.
 show_individual <- 1
@@ -767,89 +772,127 @@ message(sprintf(
 # VISUALISATION 3: LONGITUDINAL BEHAVIOUR TIME BUDGET
 # ------------------------------------------------------------------
 #
-# One panel per individual, x-axis = start of time-subset window
-# (minutes), y-axis = minutes spent on each behaviour in that window.
-# Each behaviour is drawn as a coloured line using the shared
-# beh_col palette.  The stacked-area interpretation is not used
-# because the windows may not be perfectly complete at the end,
-# so individual lines are clearer.
+# One panel per behaviour.  For every time-subset window the
+# distribution across all individuals is summarised by:
+#   • median               – solid coloured line
+#   • [Q0.05, Q0.95] band  – semi-transparent shaded ribbon
+#
+# This gives a population-level view of when each activity peaks or
+# dips across the recording session, without the clutter of n
+# individual traces.
 
-indiv_ids  <- sort(unique(long_wide$individual_id))
-n_indiv    <- length(indiv_ids)
+# Behaviours that are actually present in the wide table
+behs_present <- names(beh_col)[
+  paste0("timeBudget_", names(beh_col)) %in% names(long_wide)
+]
+n_behs <- length(behs_present)
 
-# Layout: up to 5 columns, enough rows to fit all individuals.
-n_cols_lng <- min(5L, n_indiv)
-n_rows_lng <- ceiling(n_indiv / n_cols_lng)
+# Layout: up to 5 columns, enough rows to fit all behaviours
+n_cols_lng <- min(5L, n_behs)
+n_rows_lng <- ceiling(n_behs / n_cols_lng)
 
-# Shared y-axis limit: maximum minutes in any single window × individual
-y_max_lng <- max(unlist(long_wide[, budget_cols]), na.rm = TRUE) * 1.12
+# ------------------------------------------------------------------
+# Compute median, Q0.05 and Q0.95 per behaviour × time subset,
+# aggregating across all individuals.
+# ------------------------------------------------------------------
 
-# Shared x-axis limit
+lng_summary <- lapply(behs_present, function(beh) {
+  col_nm <- paste0("timeBudget_", beh)
+  # tapply splits the column by time_subset and applies the summary
+  agg <- tapply(long_wide[[col_nm]], long_wide$time_subset, function(x) {
+    # type = 7 (default) is adequate; increase n_individuals for stable tails.
+    c(
+      med = median(x,                  na.rm = TRUE),
+      q05 = quantile(x, probs = 0.05, na.rm = TRUE),
+      q95 = quantile(x, probs = 0.95, na.rm = TRUE)
+    )
+  })
+  df <- data.frame(
+    time_subset = as.integer(names(agg)),
+    median_min  = sapply(agg, `[[`, "med"),
+    q05_min     = sapply(agg, `[[`, "q05"),
+    q95_min     = sapply(agg, `[[`, "q95")
+  )
+  df <- df[order(df$time_subset), ]
+  # Recover the wall-clock start (minutes) for this subset
+  df$start_min <- (df$time_subset - 1L) * budget_window_frames / fps / 60
+  df
+})
+names(lng_summary) <- behs_present
+
+# Shared axis limits across all panels
+y_max_lng <- max(
+  sapply(lng_summary, function(d) max(d$q95_min, na.rm = TRUE)),
+  na.rm = TRUE
+) * 1.12
 x_max_lng <- max(long_wide$start_min, na.rm = TRUE)
 
 png("time_budget_longitudinal.png",
-    width  = 280 * n_cols_lng + 60,
-    height = 220 * n_rows_lng + 120)
+    width  = 300 * n_cols_lng + 60,
+    height = 260 * n_rows_lng + 120)
 
 par(
   mfrow = c(n_rows_lng, n_cols_lng),
-  mar   = c(3.2, 3.2, 2.2, 0.5),
-  oma   = c(0, 0, 3.5, 0)
+  mar   = c(3.5, 3.8, 2.4, 0.6),
+  oma   = c(0, 0, 4.0, 0)
 )
 
-for (id in indiv_ids) {
-  sub <- long_wide[long_wide$individual_id == id, ]
-  sub <- sub[order(sub$time_subset), ]
+for (beh in behs_present) {
+  d        <- lng_summary[[beh]]
+  col_line <- beh_col[beh]
+  col_fill <- adjustcolor(col_line, alpha.f = ribbon_alpha)  # ribbon fill
 
-  # Open an empty panel with the shared axis ranges
   plot(
     NA,
-    xlim = c(0, x_max_lng),
-    ylim = c(0, y_max_lng),
-    xlab = "Time (min)",
-    ylab = "Minutes",
-    main = paste0("Individual ", id),
-    cex.main = 0.9,
-    cex.axis = 0.75,
-    cex.lab  = 0.8
+    xlim     = c(0, x_max_lng),
+    ylim     = c(0, y_max_lng),
+    xlab     = "Time (min)",
+    ylab     = "Minutes",
+    main     = beh,
+    cex.main = 1.0,
+    cex.axis = 0.78,
+    cex.lab  = 0.85
   )
 
-  # Draw one line per behaviour
-  for (beh in names(beh_col)) {
-    col_nm <- paste0("timeBudget_", beh)
-    if (col_nm %in% names(sub)) {
-      lines(
-        sub$start_min,
-        sub[[col_nm]],
-        col = beh_col[beh],
-        lwd = 1.4
-      )
-    }
-  }
+  # Shaded Q0.05 – Q0.95 ribbon.
+  # polygon() is drawn by going along the lower bound forward, then
+  # the upper bound in reverse, to close the shape correctly.
+  polygon(
+    x      = c(d$start_min, rev(d$start_min)),
+    y      = c(d$q05_min,   rev(d$q95_min)),
+    col    = col_fill,
+    border = NA
+  )
+
+  # Median line drawn on top of the ribbon
+  lines(d$start_min, d$median_min, col = col_line, lwd = 2.0)
 }
 
 # Outer title
 mtext(
   sprintf(
-    "Longitudinal time budget per individual  (window = %d frames = %.1f min)",
+    paste0("Longitudinal time budget  \u2013  median + [Q0.05, Q0.95] band",
+           "  (window = %d frames = %.1f min)"),
     budget_window_frames,
     budget_window_frames / fps / 60
   ),
-  outer = TRUE, cex = 1.05, line = 1.8
+  outer = TRUE, cex = 1.0, line = 2.0
 )
 
-# Shared legend placed in the first panel's top-right via a separate
-# overlay so it doesn't disturb the per-panel axes.
+# Legend explaining the visual encoding (line = median, band = Q range).
+# Placed as an overlay in the bottom-right of the figure so it does not
+# overwrite any individual panel.
 par(fig = c(0, 1, 0, 1), oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0), new = TRUE)
 legend(
-  x      = "topright",
-  legend = names(beh_col),
-  col    = beh_col,
-  lwd    = 2,
-  title  = "Behaviour",
+  x      = "bottomright",
+  legend = c("Median", "Q0.05 \u2013 Q0.95"),
+  col    = c("black", "gray55"),
+  lwd    = c(2.0, NA),
+  pch    = c(NA, 15),
+  pt.cex = c(NA, 1.8),
   bty    = "n",
-  cex    = 0.85,
-  inset  = c(0.01, 0.04)
+  cex    = 0.90,
+  inset  = c(0.01, 0.02)
 )
 
 dev.off()
