@@ -32,17 +32,26 @@
 #       Save metrics to CSV and plot a confusion-matrix heatmap.
 #  13.  Compute time budget per individual and in aggregate.
 #  14.  Save per-individual time budget to CSV.
+#  15.  Compute longitudinal time budget per individual per time subset
+#         (configurable window: budget_window_frames).
+#       Each frame is assigned to the time-subset window it belongs to.
+#       The result is a wide table: one column per behaviour.
+#       Useful for tracking how each animal's activity profile changes
+#       across the recording session (e.g. per-minute across one hour).
+#  16.  Save longitudinal time budget to CSV and plot a line chart.
 #
-# Generates four visualisations:
-#   confusion_matrix.png        – heatmap of the confusion matrix
-#                                 (row-normalised proportions)
-#   behaviour_time_budget.png   – mean +/- SD minutes per behaviour
-#                                 (aggregated across all individuals)
-#   keypoint_trajectories.png   – neck trajectory of one individual
-#                                 coloured by predicted behaviour
-#   keypoint_snapshots.png      – 4 × 4 grid of skeleton snapshots
-#                                 (tail → neck → head) at evenly
-#                                 spaced frames for one individual
+# Generates five visualisations:
+#   confusion_matrix.png          – heatmap of the confusion matrix
+#                                   (row-normalised proportions)
+#   behaviour_time_budget.png     – mean +/- SD minutes per behaviour
+#                                   (aggregated across all individuals)
+#   time_budget_longitudinal.png  – line chart of minutes per behaviour
+#                                   across time subsets for every individual
+#   keypoint_trajectories.png     – neck trajectory of one individual
+#                                   coloured by predicted behaviour
+#   keypoint_snapshots.png        – 4 × 4 grid of skeleton snapshots
+#                                   (tail → neck → head) at evenly
+#                                   spaced frames for one individual
 #
 # Input file (must exist in the working directory):
 #   chicken_tracking_raw.csv   (produced by SimulaKeypointTracking.R)
@@ -51,8 +60,10 @@
 #   chicken_features_for_classification.csv
 #   classification_metrics.csv
 #   time_budget_per_individual.csv
+#   time_budget_longitudinal.csv
 #   confusion_matrix.png
 #   behaviour_time_budget.png
+#   time_budget_longitudinal.png
 #   keypoint_trajectories.png
 #   keypoint_snapshots.png
 ###############################################################
@@ -70,6 +81,13 @@ smooth_k     <-  5    # rolling-mean window width for temporal smoothing (frames
 window_short <- 20    # short rolling window (~2 s at 10 fps)
 window_long  <- 50    # long  rolling window (~5 s at 10 fps)
 epsilon      <- 1e-6  # small constant added to denominators to prevent division by zero
+
+# Width (in frames) of each time subset for the longitudinal time budget.
+# Frames are assigned to subsets as: time_subset = ceiling(frame / budget_window_frames).
+# Default 600 frames = 1 minute at 10 fps.
+# Increase for coarser resolution (e.g. 3000 = 5 min) or
+# decrease for finer resolution (e.g. 100 = 10 s).
+budget_window_frames <- 600
 
 # Individual to display in the trajectory and snapshot plots.
 # Change to any valid individual_id present in the data.
@@ -625,7 +643,220 @@ dev.off()
 message("Saved: behaviour_time_budget.png")
 
 # ==============================================================
-# VISUALISATION 3: KEYPOINT TRAJECTORIES
+# 15. LONGITUDINAL TIME BUDGET PER INDIVIDUAL PER TIME SUBSET
+# ==============================================================
+#
+# Goal: track how each animal's activity profile evolves across the
+# recording session.  Rather than collapsing the entire session into
+# a single time budget (section 13), we split the session into equal-
+# width windows of budget_window_frames frames and compute a
+# separate time budget for every window.
+#
+# Terminology
+# -----------
+#   time_subset  – sequential window number starting at 1
+#                  (1 = first budget_window_frames frames, 2 = next, …)
+#   start_frame  – first frame of the window
+#                  = (time_subset − 1) × budget_window_frames + 1
+#   start_min    – elapsed time at the start of the window (minutes)
+#                  = (start_frame − 1) / fps / 60
+#
+# Output format (wide, one row per animal × window)
+# --------------------------------------------------
+#   individual_id | time_subset | start_frame | start_min |
+#   timeBudget_<beh1> | timeBudget_<beh2> | …
+#
+# timeBudget_<beh> is the number of minutes the animal spent on that
+# behaviour in the window.  Windows containing no frames for a given
+# behaviour receive 0.
+
+# ------------------------------------------------------------------
+# 15a. Assign each frame to its time-subset window
+# ------------------------------------------------------------------
+#
+# Frame numbers are 1-based (first frame = 1), which is required for
+# ceiling() to map frame 1 → subset 1 correctly.
+# Using ceiling() rather than floor()+1 means:
+#   frame 1                        → subset 1
+#   frame budget_window_frames     → subset 1
+#   frame budget_window_frames + 1 → subset 2, etc.
+# (With 0-based frames the formula would need ceiling((frame+1) / w).)
+
+feats_scaled$time_subset <- ceiling(feats_scaled$frame / budget_window_frames)
+
+# ------------------------------------------------------------------
+# 15b. Count predicted frames per individual × subset × behaviour
+# ------------------------------------------------------------------
+
+long_counts <- feats_scaled %>%
+  group_by(individual_id, time_subset, predicted) %>%
+  summarise(frames = n(), .groups = "drop")
+
+# ------------------------------------------------------------------
+# 15c. Convert frame counts to minutes
+# ------------------------------------------------------------------
+
+long_counts <- long_counts %>%
+  mutate(minutes = frames / fps / 60)
+
+# ------------------------------------------------------------------
+# 15d. Pivot to wide format: one column per behaviour
+# ------------------------------------------------------------------
+#
+# reshape() (base R) or a manual pivot avoids adding tidyr as a
+# dependency.  We use reshape() here:
+#   idvar   = the columns that uniquely identify a row in the wide table
+#   timevar = the column whose values become new column names
+#   v.names = the column whose values fill the new columns
+
+long_wide <- reshape(
+  as.data.frame(long_counts[, c("individual_id", "time_subset",
+                                "predicted", "minutes")]),
+  idvar   = c("individual_id", "time_subset"),
+  timevar = "predicted",
+  v.names = "minutes",
+  direction = "wide"
+)
+
+# reshape() names the new columns as "minutes.<behaviour>".
+# Rename them to "timeBudget_<behaviour>" for clarity.
+old_names <- grep("^minutes\\.", names(long_wide), value = TRUE)
+new_names <- sub("^minutes\\.", "timeBudget_", old_names)
+names(long_wide)[match(old_names, names(long_wide))] <- new_names
+
+# Replace NA with 0: NA arises for behaviour-window combinations where
+# the animal was never predicted to perform that behaviour.
+budget_cols <- grep("^timeBudget_", names(long_wide), value = TRUE)
+long_wide[budget_cols] <- lapply(long_wide[budget_cols],
+                                 function(x) ifelse(is.na(x), 0, x))
+
+# ------------------------------------------------------------------
+# 15e. Add human-readable time reference columns
+# ------------------------------------------------------------------
+
+long_wide$start_frame <- (long_wide$time_subset - 1) * budget_window_frames + 1
+long_wide$start_min   <- (long_wide$start_frame - 1) / fps / 60
+
+# Sort by individual and time subset for readability
+long_wide <- long_wide[order(long_wide$individual_id, long_wide$time_subset), ]
+
+# Reorder columns: id | subset | start_frame | start_min | timeBudget_…
+col_order    <- c("individual_id", "time_subset", "start_frame", "start_min",
+                  sort(budget_cols))
+long_wide    <- long_wide[, col_order]
+
+# ==============================================================
+# 16. SAVE LONGITUDINAL TIME BUDGET
+# ==============================================================
+
+write.csv(long_wide, "time_budget_longitudinal.csv", row.names = FALSE)
+message("Longitudinal time budget saved: time_budget_longitudinal.csv")
+
+message(sprintf(
+  "\nLongitudinal time budget: %d animals x %d time subsets",
+  length(unique(long_wide$individual_id)),
+  length(unique(long_wide$time_subset))
+))
+message(sprintf(
+  "Window width: %d frames = %.1f min",
+  budget_window_frames,
+  budget_window_frames / fps / 60
+))
+
+# ------------------------------------------------------------------
+# VISUALISATION 3: LONGITUDINAL BEHAVIOUR TIME BUDGET
+# ------------------------------------------------------------------
+#
+# One panel per individual, x-axis = start of time-subset window
+# (minutes), y-axis = minutes spent on each behaviour in that window.
+# Each behaviour is drawn as a coloured line using the shared
+# beh_col palette.  The stacked-area interpretation is not used
+# because the windows may not be perfectly complete at the end,
+# so individual lines are clearer.
+
+indiv_ids  <- sort(unique(long_wide$individual_id))
+n_indiv    <- length(indiv_ids)
+
+# Layout: up to 5 columns, enough rows to fit all individuals.
+n_cols_lng <- min(5L, n_indiv)
+n_rows_lng <- ceiling(n_indiv / n_cols_lng)
+
+# Shared y-axis limit: maximum minutes in any single window × individual
+y_max_lng <- max(unlist(long_wide[, budget_cols]), na.rm = TRUE) * 1.12
+
+# Shared x-axis limit
+x_max_lng <- max(long_wide$start_min, na.rm = TRUE)
+
+png("time_budget_longitudinal.png",
+    width  = 280 * n_cols_lng + 60,
+    height = 220 * n_rows_lng + 120)
+
+par(
+  mfrow = c(n_rows_lng, n_cols_lng),
+  mar   = c(3.2, 3.2, 2.2, 0.5),
+  oma   = c(0, 0, 3.5, 0)
+)
+
+for (id in indiv_ids) {
+  sub <- long_wide[long_wide$individual_id == id, ]
+  sub <- sub[order(sub$time_subset), ]
+
+  # Open an empty panel with the shared axis ranges
+  plot(
+    NA,
+    xlim = c(0, x_max_lng),
+    ylim = c(0, y_max_lng),
+    xlab = "Time (min)",
+    ylab = "Minutes",
+    main = paste0("Individual ", id),
+    cex.main = 0.9,
+    cex.axis = 0.75,
+    cex.lab  = 0.8
+  )
+
+  # Draw one line per behaviour
+  for (beh in names(beh_col)) {
+    col_nm <- paste0("timeBudget_", beh)
+    if (col_nm %in% names(sub)) {
+      lines(
+        sub$start_min,
+        sub[[col_nm]],
+        col = beh_col[beh],
+        lwd = 1.4
+      )
+    }
+  }
+}
+
+# Outer title
+mtext(
+  sprintf(
+    "Longitudinal time budget per individual  (window = %d frames = %.1f min)",
+    budget_window_frames,
+    budget_window_frames / fps / 60
+  ),
+  outer = TRUE, cex = 1.05, line = 1.8
+)
+
+# Shared legend placed in the first panel's top-right via a separate
+# overlay so it doesn't disturb the per-panel axes.
+par(fig = c(0, 1, 0, 1), oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0), new = TRUE)
+legend(
+  x      = "topright",
+  legend = names(beh_col),
+  col    = beh_col,
+  lwd    = 2,
+  title  = "Behaviour",
+  bty    = "n",
+  cex    = 0.85,
+  inset  = c(0.01, 0.04)
+)
+
+dev.off()
+message("Saved: time_budget_longitudinal.png")
+
+# ==============================================================
+# VISUALISATION 4: KEYPOINT TRAJECTORIES
 # ==============================================================
 #
 # The neck (body centre) trajectory of one individual is drawn
@@ -685,7 +916,7 @@ dev.off()
 message("Saved: keypoint_trajectories.png")
 
 # ==============================================================
-# VISUALISATION 4: SKELETON SNAPSHOTS
+# VISUALISATION 5: SKELETON SNAPSHOTS
 # ==============================================================
 #
 # A 4 × 4 grid of skeleton panels, each showing the three-
@@ -795,7 +1026,9 @@ message("Output files:")
 message("  chicken_features_for_classification.csv")
 message("  classification_metrics.csv")
 message("  time_budget_per_individual.csv")
+message("  time_budget_longitudinal.csv")
 message("  confusion_matrix.png")
 message("  behaviour_time_budget.png")
+message("  time_budget_longitudinal.png")
 message("  keypoint_trajectories.png")
 message("  keypoint_snapshots.png")
