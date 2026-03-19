@@ -199,16 +199,47 @@ simulate_individual <- function(ind_id, n_frames, states,
   neck_y <- cumsum(rnorm(n_frames, mean = 0, sd = step_sd[state_seq]))
 
   # --- 4c. Tail position ----------------------------------------------------
-  # The tail is a fixed distance (body_length) behind the neck in the
-  # positive-X direction, with small independent noise on both axes.
+  # Compute the unit vector of the neck's direction of movement at each frame.
+  # Forward differences give the heading from frame t to t+1; the final frame
+  # replicates the previous direction so it is never left as (0, 0).
+  # Any stationary frame (zero displacement) also carries forward the last
+  # valid direction, keeping the anatomical layout consistent throughout.
+  # This lets us place keypoints relative to the chicken's actual heading
+  # rather than assuming it always faces the positive-X axis.
+  dx_raw   <- diff(neck_x)                    # n_frames - 1 displacements
+  dy_raw   <- diff(neck_y)
+  norms_raw <- sqrt(dx_raw^2 + dy_raw^2)
+
+  # Normalise valid steps; mark zero-norm steps as NA for carry-forward below
+  valid    <- norms_raw > 0
+  unit_x   <- ifelse(valid, dx_raw / norms_raw, NA_real_)
+  unit_y   <- ifelse(valid, dy_raw / norms_raw, NA_real_)
+
+  # Append the last valid direction so the final frame is never (0, 0)
+  unit_x   <- c(unit_x, unit_x[length(unit_x)])
+  unit_y   <- c(unit_y, unit_y[length(unit_y)])
+
+  # Seed with (1, 0) if the very first step was zero, then carry forward
+  if (is.na(unit_x[1])) { unit_x[1] <- 1; unit_y[1] <- 0 }
+  if (any(is.na(unit_x))) {
+    for (i in 2:n_frames) {
+      if (is.na(unit_x[i])) { unit_x[i] <- unit_x[i - 1]
+                               unit_y[i] <- unit_y[i - 1] }
+    }
+  }
+
+  # The tail is a fixed distance (body_length) behind the neck along the
+  # direction of movement, with small independent noise on both axes.
   # This noise represents natural tail sway as well as tracker uncertainty.
-  tail_x <- neck_x - body_length + rnorm(n_frames, 0, 0.01)
-  tail_y <- neck_y               + rnorm(n_frames, 0, 0.01)
+  tail_x <- neck_x - body_length * unit_x + rnorm(n_frames, 0, 0.01)
+  tail_y <- neck_y - body_length * unit_y + rnorm(n_frames, 0, 0.01)
 
   # --- 4d. Head position ----------------------------------------------------
-  # Default head posture: slightly in front of and above the neck.
-  head_x <- neck_x + head_offset_x + rnorm(n_frames, 0, 0.015)
-  head_y <- neck_y + head_offset_y + rnorm(n_frames, 0, 0.015)
+  # Default head posture: slightly in front of (head_offset_x along the
+  # movement direction) and slightly above (head_offset_y along the
+  # perpendicular direction rotated 90° counter-clockwise: (-unit_y, unit_x)).
+  head_x <- neck_x + head_offset_x * unit_x - head_offset_y * unit_y + rnorm(n_frames, 0, 0.015)
+  head_y <- neck_y + head_offset_x * unit_y + head_offset_y * unit_x + rnorm(n_frames, 0, 0.015)
 
   # Behaviour-specific head offsets simulate characteristic postures:
   #   Pecking  → head drops below the neck level (negative Y offset)
